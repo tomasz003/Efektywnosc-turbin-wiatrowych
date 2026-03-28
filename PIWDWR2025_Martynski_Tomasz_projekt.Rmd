@@ -1,0 +1,571 @@
+---
+title: "Projekt - Przetwarzanie i wstęp do wizualizacji danych w R"
+author: "Tomasz Martyński, nr indeksu 416797"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: cerulean
+    toc: true
+    toc_float:
+      collapsed: true
+  pdf_document:
+    toc: true
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+```
+
+```{r}
+library(flexdashboard)
+library(dplyr)
+library(tidyr)
+library(readxl)
+library(ggplot2)
+library(plotly)
+library(gt)
+library(fitdistrplus)
+library(microbenchmark)
+```
+
+## 1) Przygotowanie danych
+
+Zacznijmy od wczytania odpowiednich danych zgodnie z numerem indeksu:
+$416797 \rightarrow 7$ , a więc dataset nr 7.
+
+```{r}
+dane=read_excel("zestaw7_I01_2009_12.xlsx")
+```
+
+Nasz projekt opiera się na danych pomiaru wiatru z instalacji I01
+zbieranych w grudniu 2009r. Podamy teraz więcej szczegółów o tej
+instalacji.
+
+## 2) Opis instalacji pomiarowej
+
+Poniżej została zbudowana i wyświetlona ramka danych, która prezentuje
+najważniejsze cechy naszej instalacji, takie jak nazwa urządzenia, kanał
+(CH), wysokość zamontowania czy jednostka wielkości fizycznej, jaką ono
+mierzy. Ta instalacja nie ma czujnika wilgotności (CH9), tak że
+pominiemy go w poniższej wizualizacji.
+
+```{r}
+instalacja_df=data.frame(
+    Kanał = c("CH1", "CH4", "CH5", "CH6", "CH7", "CH8", "CH10", "CH11", "CH12"),
+    Urządzenie = c(
+    "Anemometr (backup)",
+    "Anemometr (backup)",
+    "Anemometr",
+    "Anemometr",
+    "Wiatrowskaz 1",
+    "Wiatrowskaz 2",
+    "Czujnik ciśnienia",
+    "Czujnik temperatury",
+    "Logger (rejestrator danych) – napięcie"
+    ),
+    Jednostka=c("m/s","m/s", "m/s", "m/s", "°", "°", "hPa","°C", "V"),
+    Wysokość = c(50.65, 30.10, 50.75, 30.20,
+      48.10, 27.50, 8, 9, 8)
+)
+
+gt(instalacja_df) %>% 
+  tab_header(title="Opis instalacji pomiarowej", subtitle = "Instalacja I01") %>% 
+  tab_footnote(
+    footnote = "Nie używamy tych danych, były zbierane jako backup",
+    locations = cells_body(columns=Urządzenie, rows=c(1,2))
+  ) %>% 
+  cols_label(
+    Wysokość=html("Wysokość (m)")
+  )
+```
+
+Wiedząc już, z jakich urządzeń mamy dostępne dane, przystąpmy do
+wstępnych analiz prędkości wiatru.
+
+## 3) Wykres prędkości wiatru i temperatury, przymarznięcia
+
+Zobaczmy jak zmieniała się prędkość wiatru przez cały grudzień - zgodnie
+z poleceniem bierzemy dane z dwóch anemometrów, CH5 oraz CH6 - i
+zestawmy to z temperaturą powietrza.
+
+```{r}
+wykres=plot_ly(mode="lines")
+
+wykres %>% 
+  add_trace(x=~dane$`Date & Time Stamp`, y=~dane$CH5Avg, name="CH5") %>% 
+  add_trace(x=~dane$`Date & Time Stamp`, y=~dane$CH6Avg, name="CH6") %>% 
+  add_trace(x=~dane$`Date & Time Stamp`, y=~dane$CH11Avg, name="Temperatura", line=list(color="black"))->wykres
+
+
+wykres %>% layout(
+  title="Wykres prędkości wiatru oraz temperatury w grudniu 2009r.",
+  legend=list(title=list(text="Anemometry")),
+  xaxis=list(title="Czas pomiaru"),
+  yaxis=list(title="Prędkość (m/s)"),
+  yaxis2=list(title="Temperatura (w °C)", overlaying="y", side="right")
+  
+)
+```
+
+Obserwujemy, że między 15 a 18 grudnia są wypłaszczenia prędkości w
+okolicach zera. Nie brzmi to jak realna obserwacja wiatru, a bardziej
+jak przymarznięcie urządzeń pomiarowych - tę hipotezę potwierdza srogi
+mróz (między $-8$ a $-15^{\circ} C$). Potraktujemy te obserwacje jako
+wadliwe dane, które musimy usunąć podczas preprocessingu danych.
+
+## 4) Funkcja przygotowania danych - preprocessing
+
+Przed startem poważnej pracy dobrze przetworzyć nasze dane, z dwóch
+głównych powodów:
+
+-   trzeba rozwiązać problem przymarznięć urządzeń pomiarowych
+
+-   mamy mnóstwo zmiennych, których nie będziemy używać.
+
+Napiszmy funkcję, która przeprowadzi taki preprocessing naszych danych,
+dodatkowo dodając zmienną "Sektor" opisującą kierunek wiatru. Kierunki
+nie powinny się znacząco róznić między obserwacjami z CH7 i CH8, więc do
+tej zmiennej weźmiemy ten pierwszy, wyżej zamontowany.
+
+Co do przymarznięć, obserwację uznamy za takowe, gdy będą spełnione trzy
+warunki:
+
+-   temperatura w danym momencie jest nie większa niż $1^{\circ} C$
+
+-   odchylenie standardowe jest nie większe niż $0.1$
+
+-   prędkość jest nie większa niż $0.5$ m/s.
+
+Pozbądźmy się takich obserwacji.
+
+```{r}
+preprocessing<-function(ramka){
+  ramka %>% 
+    mutate(
+      CH5Avg=ifelse(ramka$CH11Avg<1 & ramka$CH5SD<=0.1 & ramka$CH5Avg<=0.5, NA, ramka$CH5Avg),
+  CH6Avg=ifelse(ramka$CH11Avg<1 & ramka$CH6SD<=0.1 & ramka$CH6Avg<=0.5, NA, ramka$CH6Avg),
+  
+  Sektor=case_when(
+  CH7Avg>=337.5 | CH7Avg<22.5 ~ "N",
+  CH7Avg>=22.5  & CH7Avg<67.5 ~ "NE",
+  CH7Avg>=67.5  & CH7Avg<112.5 ~ "E",
+  CH7Avg>=112.5 & CH7Avg<157.5 ~ "SE",
+  CH7Avg>=157.5 & CH7Avg<202.5 ~ "S",
+  CH7Avg>=202.5 & CH7Avg<247.5 ~ "SW",
+  CH7Avg>=247.5 & CH7Avg<292.5 ~ "W",
+  CH7Avg>=292.5 & CH7Avg<337.5 ~ "NW",
+  TRUE ~ "brak danych"
+)
+  )->ramka
+  
+  ramka %>% 
+    dplyr::select(`Date & Time Stamp`, Sektor, CH5Avg, CH6Avg, CH7Avg)->nowa_ramka
+  
+  return(nowa_ramka)
+  }
+```
+
+Słówko komentarza co do przedostatniej linijki i użycia "dplyr ::
+select" - na początku działał zwykły select, ale w którymś momencie
+przestał. Prawdopodobnie któryś z innych zaimportowanych pakietów
+nadpisuje funkcję select, a więc zrobiliśmy najprostszą korektę,
+wywołując explicite "select z dplyra".
+
+## 5) Czas działania funkcji przygotowania danych
+
+Pozwoliłem sobie zmienić lekko kolejność o tyle, że naturalniej byłoby
+przetestować naszą funkcję tuż po napisaniu, a nie dopiero później.
+Użyjemy do tego funkcji microbenchmark z biblioteki o takiej samej
+nazwie.
+
+```{r}
+pomiar=microbenchmark(preprocessing(dane), times=1000)
+autoplot(pomiar)+
+  ggtitle("Funkcja preprocessing - czas działania")
+```
+
+Szybki wniosek - ogólnie nie jest źle, funkcja wykonuje się na ogół w
+mniej niż $30$ ms, bardzo rzadko kiedy trwa to ponad $100$ ms.
+
+## 6) Ponowny wykres prędkości wiatru
+
+Ponownie zróbmy wykres prędkości wiatru, jak w punkcie 3), ale na
+uprzednio przygotowanych danych.
+
+```{r}
+data_cleaned=preprocessing(dane)
+
+wykres_2=plot_ly(mode="lines")
+
+wykres_2 %>% 
+  add_trace(x=~dane$`Date & Time Stamp`, y=~data_cleaned$CH5Avg, name="CH5") %>% 
+  add_trace(x=~dane$`Date & Time Stamp`, y=~data_cleaned$CH6Avg, name="CH6")->wykres_2
+
+
+wykres_2 %>% layout(
+  title="Wykres prędkości wiatru po przygotowaniu danych",
+  legend=list(title=list(text="Anemometry")),
+  xaxis=list(title="Czas pomiaru"),
+  yaxis=list(title="Prędkość (m/s)")
+)
+```
+
+Widzimy, że skutecznie udało nam się usunąć wadliwe dane wynikające
+prawdopodobnie z przymarznięć urządzeń pomiarowych - nie mamy już
+wypłaszczeń w okolicach zerowej wartości prędkości.
+
+## 7) Profil pionowy wiatru
+
+Zacznijmy od porcji obliczeń, które pozwolą nam przybliżyć prędkość
+wiatru w zależności od wysokości, w oparciu o dane średnie.
+
+Pierwszy model, z którego skorzystamy, opiera się na wzorze
+**Hellmana-Suttona**. Do wyliczenia $w$ użyjemy wspomnianego wzoru:
+
+$$V_5=V_6 \cdot \left(\frac{h_5}{h_6}\right)^w$$ Wyliczamy $w$ i mamy:
+
+$$w=log_{\frac{h_5}{h_6}}\left(\frac{V_5}{V_6}\right)=\frac{ln\left(\frac{V_5}{V_6}\right)}{ln\left(\frac{h_5}{h_6}\right)}=\frac{ln(V_5)-ln(V_6)}{h_5-h_6}$$
+gdzie $V_5$ - śr. prędkość anemometru CH5, $V_6$ - śr. prędkość CH6,
+$h_5$ - wysokość CH5, $h_6$ - wysokość CH6. Przeliczmy.
+
+```{r}
+V_5=mean(na.omit(data_cleaned$CH5Avg))
+V_6=mean(na.omit(data_cleaned$CH6Avg))
+h_5=50.75
+h_6=30.2
+
+w=(log(V_5)-log(V_6))/(log(h_5)-log(h_6))
+w
+```
+
+Druga próba estymacji prędkości oprze się o **prawo logarytmiczne
+profilu wiatru**. Do wyliczenia $z_0$ użyjemy wzoru:
+
+$$
+V_5=V_6\cdot\frac{ln(h_5/z_0)}{ln(h_6/z_0)}
+$$
+
+Przekształcamy elementarnie tak, aby wyliczyć $z_0$. Zakładamy, że
+$V_5 \neq V_6$.
+
+$$
+V_5\cdot ln(h_6/z_0)=V_6 \cdot ln(h_5/z_0)
+$$
+
+$$
+\left(\frac{h_6}{z_0}\right)^{V_5}=\left(\frac{h_5}{z_0}\right)^{V_6}
+$$
+
+$$
+\frac {{h_6}^{V_5}}{{h_5}^{V_6}}={z_0}^{V_5-V_6}
+$$
+
+$$
+z_0=\left(\frac{h_6^{V_5}}{h_5^{V_6}}\right)^\frac{1}{V_5-V_6}
+$$
+
+```{r}
+z_0=(h_6^V_5/h_5^V_6)^(1/(V_5-V_6))
+z_0
+```
+
+Napiszmy teraz funkcje modelujące wspomniane wzory na prędkość
+korzystające z powyższych wzorów i ze stałych.
+
+```{r}
+hell_sutt<-function(h){
+  return(V_5*(h/h_5)^w)
+}
+
+prawo_log<-function(h){
+  return(V_5*log(h/z_0)/log(h_5/z_0))
+}
+```
+
+Zwizualizujmy te funkcje na wykresie, wraz z danymi z pomiarów (które
+oczywiście będą leżeć na nich, drobne rozjazdy to kwestie zaokrągleń i
+błędów numerycznych).
+
+```{r}
+wysokosci <- seq(10, 130, by = 1)
+
+pion_prof_df <- data.frame(
+  h = wysokosci,
+  Hellman = hell_sutt(wysokosci),
+  Prawo_Log = prawo_log(wysokosci)
+)
+
+plot_ly(pion_prof_df, x = ~h) %>%
+  add_lines(y = ~Hellman, name = "Wzór Hellmana-Suttona") %>%
+  add_lines(y = ~Prawo_Log, name = "Prawo logarytmiczne") %>%
+  add_markers(x=c(h_5, h_6), y=c(V_5, V_6), name="Dane z pomiarów") %>% 
+  layout(
+    title = "Profil pionowy wiatru",
+    xaxis = list(title = "Wysokość (m)"),
+    yaxis = list(title = "Prędkość wiatru (m/s)")
+  )
+```
+
+## 8) Róża wiatrów
+
+Teraz zróbmy różę wiatrów, która pokaże nam, w jakich kierunkach
+najczęściej wiał wiatr.
+
+Najwyższy anemometr to CH5, a więc będziemy brać pod uwagę dane z niego.
+Z powodów wspomnianych wcześniej ograniczymy się też do pomiaru kątów
+wiatrowskazu CH7.
+
+Jak widzimy, zmienna Sektor nie ma wartości NA, a więc nie musimy się
+przejmować brakującymi wartościami.
+
+```{r}
+moje_kolorki=c(  "blue","purple", "red", "orange",  "yellow", "darkgreen", "black","darkblue")
+
+
+sum(is.na(data_cleaned$Sektor))
+wind <- data_cleaned %>%
+  count(Sektor) %>%
+  mutate(
+    procent = n/sum(n)*100
+  )
+
+wind <- wind %>%
+  mutate(
+    theta = factor(
+      Sektor,
+      levels = c("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+    )
+  )
+
+plot_ly(wind,
+        r=~procent,
+        theta=~theta,
+        type="barpolar",
+        color=~theta,
+        colors=moje_kolorki) %>%
+  layout(
+    title="Róża wiatrów dla CH5",
+    polar = list(
+      angularaxis = list(direction = "clockwise",rotation = 90),
+      radialaxis = list(ticksuffix = "%")
+    ),
+    showlegend = TRUE
+  )
+```
+
+Wnioski - dużo częściej rejestrowaliśmy wiatry południowe - to ważny
+czynnik, który mógłby nam pomoć przy decyzji, w którą stronę postawić
+kolejne wiatraki.
+
+## 9) Histogram prędkości wiatru z CH5
+
+Celem dwóch następnych punktów będzie przybliżenie możliwej rocznej
+produkcji energii przy wykorzystaniu różnych turbin wiatrowych.
+
+Zajmijmy się najpierw rozkładem prędkości wiatru zmierzonej za pomocą
+anemometru CH5. Naszym celem będzie przybliżyć go rozkładem Weibulla.
+Spójrzmy na to, jak wyglądają nasze dane.
+
+```{r}
+ggplot(data_cleaned, aes(x=CH5Avg))+
+  geom_histogram(aes(y=..density..), bins=40, fill="#CC8500", color="black")+
+  geom_density(color="#005800", linewidth=1.25)+
+  labs(title="Histogram prędkości wiatru (CH5)",
+       x="Prędkość (m/s)",
+       y="Gęstość")
+```
+
+Spróbujmy dopasować do tych danych rozkład Weibulla:
+$Weibull (\lambda, k)$. Mówiąc dokładniej, spróbujemy wyestymować
+parametry $\lambda$ (skala) oraz $k$ (kształt).
+
+Najpierw przygotujemy dane tak, by zostały tylko obserwacje będące
+dodatnimi liczbami, a następnie znajdziemy szukane parametry.
+
+```{r}
+x=na.omit(data_cleaned$CH5Avg)
+x=x[x>0]
+
+fit_weib=fitdist(x, "weibull")
+fit_weib
+```
+
+Estymowane parametry: $\lambda \approx 6.52, k \approx 2.40$.
+
+Zobaczmy jeszcze, czy tak dobrany rozkład w miarę sensownie modeluje ten
+faktyczny.
+
+```{r}
+plot(fit_weib)
+```
+
+Z wykresów widzimy, że:
+
+-   estymator gęstości dość dobrze leży na histogramie z danych
+
+-   punkty na Q-Q plocie oraz na P-P plocie leżą na przekątnej
+
+-   dystrybuanta empiryczna i ta Weibullowa pokrywają się.
+
+To wszystko oznaki, że nasz rozkład jest dobrze dopasowany.
+
+## 10) Roczna produkcja energii - porównanie
+
+Do naszych szacowań weźmiemy trzy następujące modele turbin:
+
+-   Vestas V110 - moc znamionowa $2.0\,W$, stosowana głównie na farmach
+    lądowych o umiarkowanych warunkach wiatrowych
+-   GE Wind Energy 2.75/120 - moc znamionowa $2.75 \,W$, stosowana
+    głównie na farmach lądowych o niskiej i średniej prędkości wiatru
+-   Nordex N131 - moc znamionowa $3.6\,W$, stosowana głównie w obszarach
+    śródlądowych, przy słabszym wietrze.
+
+Wprowadźmy te dane i obliczmy średnią planowaną produkcję przy założeniu
+rozkładu Weibulla z parametrami $\lambda=6.52, k=2.40$.
+
+```{r}
+turbiny=data.frame(
+  nazwa=c("Vestas V110", "GE Renewable Energy", "Nordex N131"),
+  moc_MW=c(2.0, 2.5, 3.6),
+  produkcja_GWh=c(5.962, 7.474, 9.205)
+)
+
+gt(turbiny) %>% 
+  tab_header(title="Szacowana roczna produkcja energii", subtitle="Porównanie różnych turbin") %>%
+  tab_source_note(source_note="Źródło obliczeń: The Swiss Wind Power Data Website") %>% 
+  cols_label(
+    nazwa=html("Nazwa turbiny"),
+    moc_MW=html("Moc (MW)"),
+    produkcja_GWh=html("Produkcja (GWh/rok)")
+  )
+```
+
+Jak widzimy, największa produkcja energii jest przewidywana dla turbiny
+Nordex N131, co może wynikać z tego, że ma niższą prędkość znamionową i
+jest przystosowana do pracy przy niższych prędkościach wiatru.
+Otrzymaliśmy też przewidywaną wartość produkcji rocznej, co wydatnie
+pomogłoby oszacować opłacaność inwestycji kupna, montażu i utrzymania
+wiatraka.
+
+## 11) Histogramy i boxploty w zależności od kierunku wiatru, wnioski
+
+Spróbujmy jeszcze trochę "pogrzebać" przy rozkładzie kierunku wiatru
+(zmienna Sektor). Do wizualizacji weźmiemy dane z najwyższego anemometru
+(CH5). Zacznijmy od wygenerowania boxplotów prędkości od sektora.
+
+```{r}
+ggplot(
+  data_cleaned %>% filter(!is.na(CH5Avg)),
+  aes(x=Sektor, y=CH5Avg)
+) +
+  geom_boxplot(fill="#CC8500", color="black") +
+  labs(
+    title = "Rozkład prędkości wiatru w zależności od kierunku",
+    x = "Sektor",
+    y = "Prędkość wiatru (m/s)"
+  )
+```
+
+Spójrzmy jeszcze teraz na histogramy w każdym z sektorów kierunku
+wiatru.
+
+```{r}
+hist_sektor <- function(df, sektor) {
+  df %>%
+    filter(Sektor == sektor, !is.na(CH5Avg)) %>%
+    ggplot(aes(x = CH5Avg)) +
+    geom_histogram(bins = 30, fill = "#CC8500", color = "black") +
+    labs(
+      title = paste("Histogram prędkości wiatru: kierunek", sektor),
+      x = "Prędkość wiatru (m/s)",
+      y = "Liczba obserwacji"
+    )
+}
+
+
+sektory=c("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+
+lapply(sektory, function(x) {hist_sektor(data_cleaned, x)})
+```
+
+Na podstawie powyższych wykresów możemy wyciągnąć wnioski dotyczące
+rozkładu wiatru. Widzimy, że wiatry północne i zachodnie mają średnio
+częściej większą prędkość niż wschodnie i południowe, i mając na uwadze
+również rozkład częstości wiania w każdym kierunku z 8), można ocenić,
+że najlepszą kombinację częstości i szybkość wiatru mamy w kierunku SW
+(południowy zachód).
+
+Czy to znaczy, że w tę stronę należałoby postawić wiatrak?
+Niekoniecznie, bo być może częstość wiania będzie dla nas dużo
+ważniejsza niż prędkość - to zależy m.in. od prędkości znamionowej
+turbiny, której użyjemy.
+
+## 12) Średnie dzienne prędkości wiatru
+
+Na koniec obliczymy średnią prędkość wiatru zarejestrowaną przez każdy z
+anemometrów dla każdego dnia grudnia.
+
+Należy pamiętać, że nasz zbiór danych ma duże braki pomiarów w
+niektórych dniach i średnia jest wówczas liczona na podstawie znacznie
+mniejszej liczby danych.
+
+```{r}
+sr_dzienne=data_cleaned%>%
+  mutate(dzień = as.Date(`Date & Time Stamp`))%>%
+  group_by(dzień)%>%
+  summarise(
+    CH5_srednie=round(mean(CH5Avg, na.rm=TRUE),3),
+    CH6_srednie=round(mean(CH6Avg, na.rm=TRUE),3)
+  ) %>% 
+  ungroup()
+
+gt(sr_dzienne) %>% 
+  tab_header(title="Średnie dzienne pomiarów z obu anemometrów", subtitle="Dane z grudnia 2009r.") %>% 
+  cols_label(
+    dzień=html("Data"),
+    CH5_srednie=html("CH5"),
+    CH6_srednie=html("CH6")
+  )
+```
+
+## 13) Animowany wykres średnich prędkości
+
+Na sam koniec zobaczmy jeszcze animowany wykres wykorzysujący dane
+średnich prędkości rejestrowanych każdego dnia przez anemometry, które
+usystematyzowaliśmy w poprzednim punkcie.
+
+```{r}
+srednie_long <- sr_dzienne %>%
+  pivot_longer(
+    cols = c(CH5_srednie, CH6_srednie),
+    names_to = "Anemometr",
+    values_to = "Srednia_predkosc"
+  ) %>% 
+  mutate(Dzień=as.character(dzień)) %>% 
+  mutate(Anemometr=factor(Anemometr,
+    levels = c("CH5_srednie", "CH6_srednie"),
+    labels = c("CH5", "CH6")
+    )
+  )
+
+plot_ly(srednie_long, x = ~Anemometr, y = ~Srednia_predkosc, color = ~Anemometr, frame = ~Dzień, type = "bar") %>%
+  layout(
+    title = "Średnie dzienne prędkości wiatru",
+    xaxis = list(title = "Anemometr"),
+    yaxis = list(title = "Średnia prędkość (m/s)")
+  ) %>%
+  animation_opts(frame = 1000)
+```
+
+Reasumując, nasz projekt przedstawia dane dotyczące pomiaru wiatru w
+grudniu 2009r. i analizuje je pod względem rozkładu prędkości, kierunku
+i potencjalnej wyprodukowanej energii. Pozwala on wyciągnąć informacje,
+które mogłyby służyć jako wstępna analiza tego, czy opłaca się
+zainwestować w kolejne turbiny wiatrowe w tej okolicy i w jaką stronę je
+ustawić.
+
+Cała nasza analiza opierała się o narzędzia do przetwarzania i
+wizualizacji danych w R, które poznaliśmy na tym przedmiocie.
